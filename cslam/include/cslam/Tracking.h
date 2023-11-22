@@ -115,7 +115,65 @@ public:
 
     int mSensor;
 
-   
+cv::Mat make_pad(const cv::Mat& one_image, const int pad_H, const int pad_W);
+    
+
+        template<typename T>
+cv::Mat compute_dark_channel(const cv::Mat& origin, const int H, const int W, const int radius=7) {
+    const T* const ori_ptr = origin.ptr<T>();
+    // 决定数据类型, 是 uchar 还是 float
+    const int TYPE = origin.type() == CV_8UC3 ? CV_8UC1 : CV_32FC1;
+    // 【1】先 R, G, B 三通道求一个最小图
+    cv::Mat min_bgr(H, W, TYPE);
+    T* const min_bgr_ptr = min_bgr.ptr<T>();
+    const int length = H * W;
+    for(int i = 0;i < length; ++i) {
+        const int p = 3 * i;
+        min_bgr_ptr[i] = std::min(ori_ptr[p], std::min(ori_ptr[p + 1], ori_ptr[p + 2]));
+    }
+    // 【2】min_bgr 中每个点, 在窗口中找一个最小值
+    // 先对图像做 padding
+    cv::Mat padded_image;
+    cv::copyMakeBorder(min_bgr, padded_image, radius, radius, radius, radius, cv::BORDER_REFLECT);
+    auto pad_min_bgr = padded_image;
+    const int H2 = H + 2 * radius;
+    const int W2 = W + 2 * radius;
+    // 存放第一次横向找最小值地结果
+    cv::Mat temp(H2, W, TYPE);
+    T* const temp_ptr = temp.ptr<T>();
+    int cnt = 0;
+    // 第一次, 横向找 H2 次
+    for(int i = 0;i < H2; ++i) {
+        T* const row_ptr = pad_min_bgr.ptr<T>() + i * W2 + radius;
+        for(int j = 0;j < W; ++j) {
+            T min_value = 255;
+            for(int k = -radius; k <= radius; ++k)
+                min_value = std::min(min_value, row_ptr[j + k]);
+            temp_ptr[cnt++] = min_value;
+        }
+    }
+    // 释放空间
+    pad_min_bgr.release();
+    // 第二次, 竖向比较
+    for(int j = 0;j < W; ++j) {
+        for(int i = 0;i < H; ++i) {
+            T min_value = 255;
+            const int offset = (radius + i) * W + j;
+            for(int k = -radius; k <= radius; ++k)
+                min_value = std::min(min_value, temp_ptr[offset + k * W]);
+            min_bgr_ptr[i * W + j] = min_value;  // 结果直接存放到 min_bgr 里面, 节约空间
+        }
+    }
+    return min_bgr;
+}
+
+   std::list< std::pair<std::string, cv::Mat> >dong_enhance(
+        const cv::Mat& low_light,
+        const int radius=3,
+        const int A_pixels=100,
+        const float weight=0.8,
+        const float border=0.5,
+        const bool denoise=false) ;
 
     eTrackingState mState;
     eTrackingState mLastProcessedState;
@@ -127,7 +185,7 @@ public:
      //myadd
     cv::Mat mImRGB;
     cv::Mat imDepth ;
-;// adding mImDepth member to realize pointcloud view
+// adding mImDepth member to realize pointcloud view
 
     kfptr GetReferenceKF();
     std::vector<mpptr> GetLocalMPs(){return mvpLocalMapPoints;}

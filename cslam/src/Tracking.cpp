@@ -143,13 +143,14 @@ cv::Mat Tracking::GrabImageRGBD(const cv::Mat &im, const cv::Mat &depthmap, cons
     imDepth = depthmap;
 
     // step 1：将RGB或RGBA图像转为灰度图像
-    if(mImGray.channels()==3)
+    /*if(mImGray.channels()==3)
     {
         if(mbRGB){
             cvtColor(mImGray,mImGray,CV_RGB2GRAY);
            
             vector<int> res=GetValue(mImGray);
-            if (res[1]> 2){
+            cout<<res[1]<<" "<<res[0]<<endl;
+            if (res[1]<1){
                 if (res[0] > 0){
                     std::cout << "\033[1;33m!!! +++ 亮度异常 过亮 +++ !!!\033[0m" <<res[0] << std::endl;
                     cv::Ptr<CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
@@ -235,7 +236,30 @@ cv::Mat Tracking::GrabImageRGBD(const cv::Mat &im, const cv::Mat &depthmap, cons
             }
         }
             
-    }
+    }*/
+
+auto collections = dong_enhance(mImRGB, 3, 100, 0.8, 0.5, false);
+    mImRGB= collections.back().second;
+     cvtColor(mImRGB,mImGray,CV_RGB2GRAY);
+
+     vector<int> res=GetValue(mImGray);
+     //cout<<res[1]<<" "<<res[0]<<endl;
+            if (res[1]>2){
+                if (res[0] > 0){
+                    //std::cout << "\033[1;33m!!! +++ 亮度异常 过亮 +++ !!!\033[0m" <<res[0] << std::endl;
+                    cv::Ptr<CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+	                clahe->setClipLimit(4);
+	                clahe->setTilesGridSize(cv::Size(10, 10));
+	                clahe->apply(mImGray, mImGray);
+                }
+                 else {
+                    //std::cout << "\033[1;33m!!! +++ 亮度异常 过暗 +++ !!!\033[0m" << res[0] << std::endl;
+                    cv::Ptr<CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+	                clahe->setClipLimit(4);
+	                clahe->setTilesGridSize(cv::Size(10, 10));
+	                clahe->apply(mImGray, mImGray);
+                }
+            }
     // step 2 ：将深度相机的disparity转为Depth , 也就是转换成为真正尺度下的深度
     if((fabs(mDepthMapFactor-1.0f)>1e-5) || imDepth.type()!=CV_32F)
         imDepth.convertTo(  //将图像转换成为另外一种数据类型,具有可选的数据大小缩放系数
@@ -1623,6 +1647,153 @@ bool Tracking::Relocalization()
         mnLastRelocFrameId = mCurrentFrame->mId;
         return true;
     }
-}
 
+
+}
+template<typename T>
+cv::Mat compute_dark_channel(const cv::Mat& origin, const int H, const int W, const int radius=7) {
+    const T* const ori_ptr = origin.ptr<T>();
+    // 决定数据类型, 是 uchar 还是 float
+    const int TYPE = origin.type() == CV_8UC3 ? CV_8UC1 : CV_32FC1;
+    // 【1】先 R, G, B 三通道求一个最小图
+    cv::Mat min_bgr(H, W, TYPE);
+    T* const min_bgr_ptr = min_bgr.ptr<T>();
+    const int length = H * W;
+    for(int i = 0;i < length; ++i) {
+        const int p = 3 * i;
+        min_bgr_ptr[i] = std::min(ori_ptr[p], std::min(ori_ptr[p + 1], ori_ptr[p + 2]));
+    }
+    // 【2】min_bgr 中每个点, 在窗口中找一个最小值
+    // 先对图像做 padding
+    cv::Mat padded_image;
+    cv::copyMakeBorder(min_bgr, padded_image, radius, radius, radius, radius, cv::BORDER_REFLECT);
+    auto pad_min_bgr = padded_image;
+    const int H2 = H + 2 * radius;
+    const int W2 = W + 2 * radius;
+    // 存放第一次横向找最小值地结果
+    cv::Mat temp(H2, W, TYPE);
+    T* const temp_ptr = temp.ptr<T>();
+    int cnt = 0;
+    // 第一次, 横向找 H2 次
+    for(int i = 0;i < H2; ++i) {
+        T* const row_ptr = pad_min_bgr.ptr<T>() + i * W2 + radius;
+        for(int j = 0;j < W; ++j) {
+            T min_value = 255;
+            for(int k = -radius; k <= radius; ++k)
+                min_value = std::min(min_value, row_ptr[j + k]);
+            temp_ptr[cnt++] = min_value;
+        }
+    }
+    // 释放空间
+    pad_min_bgr.release();
+    // 第二次, 竖向比较
+    for(int j = 0;j < W; ++j) {
+        for(int i = 0;i < H; ++i) {
+            T min_value = 255;
+            const int offset = (radius + i) * W + j;
+            for(int k = -radius; k <= radius; ++k)
+                min_value = std::min(min_value, temp_ptr[offset + k * W]);
+            min_bgr_ptr[i * W + j] = min_value;  // 结果直接存放到 min_bgr 里面, 节约空间
+        }
+    }
+    return min_bgr;
+}
+std::list< std::pair<std::string, cv::Mat> > Tracking::dong_enhance(
+        const cv::Mat& low_light,
+        const int radius,
+        const int A_pixels,
+        const float weight,
+        const float border,
+        const bool denoise){
+            std::list< std::pair<std::string, cv::Mat> > collections;
+    // 获取信息
+    const int H = low_light.rows;
+    const int W = low_light.cols;
+    const int C = low_light.channels();
+    const int length = H * W;
+    const int total_length = length * C;
+    assert(low_light.type() == 16 and "Only CV_8U3(BGR) are supported !");
+
+    //【1】首先 255 - low_light, 得到反转图像
+    cv::Mat inverse(H, W, low_light.type());
+    uchar* const inv_ptr = inverse.ptr<uchar>();
+    for(int i = 0;i < total_length; ++i)
+        inv_ptr[i] = 255 - low_light.data[i];
+    collections.emplace_back("inverse", inverse);
+
+    // 【2】对 inverse 去雾, 首先求 inverse 的暗通道
+    const auto dark_channel = compute_dark_channel<uchar>(inverse, H, W, radius);
+    collections.emplace_back("dark_channel", dark_channel);
+
+    // 【3】根据暗通道, 排序筛选最大值的前 100 个点
+    // 在 有雾图像中去找 rgb 之和最大值作为对三个通道大气光 A 的估计
+    std::vector< std::vector<int> > book(256);
+    const uchar* const dark_ptr = dark_channel.ptr<uchar>();
+    for(int i = 0;i < length; ++i)
+        book[dark_ptr[i]].emplace_back(i);
+    int cnt = 0;
+    std::vector<int> index(A_pixels);  // 找到暗通道最大的 100 个点坐标
+    for(int i = 255; i >= 0; --i) {
+        const int _size = book[i].size(); // 这里是 O(1)
+        for(int t = 0;t < _size and cnt < A_pixels; ++t)
+            index[cnt++] = book[i][t];
+    }
+    int max_bgr_sum = 0;  // 从这 100 个暗通道最大值对应 有雾图像 中, 找 r, g, b 之和最大的点
+    int max_index = -1;
+    for(int i = 0;i < A_pixels; ++i) {
+        const int p = 3 * index[i];
+        const int cur_sum = inv_ptr[p] + inv_ptr[p + 1] + inv_ptr[p + 2];
+        if(cur_sum > max_bgr_sum) {
+            max_bgr_sum = cur_sum;
+            max_index = index[i];
+        }
+    }
+    // 现在 max_index 是最大的 r, g, b 的通道
+    int A[3] = {inv_ptr[max_index * 3], inv_ptr[max_index * 3 + 1], inv_ptr[max_index * 3 + 2]};
+    //std::cout << "三个通道的全局大气光估计值 " << A[0] << ", " << A[1] << ", " << A[2] << "\n";
+
+    // 【4】估计 t
+    // 准备一个 float 图, 每个通道的像素除以对应的全局大气光
+    cv::Mat R_A(H, W, CV_32FC3);
+    float* const R_A_ptr = R_A.ptr<float>();
+    for(int i = 0;i < length; ++i) {
+        const int p = 3 * i;
+        for(int c = 0;c < 3; ++c)
+            R_A_ptr[p + c] = inv_ptr[p + c] * 1.f / A[c];
+    }
+    // 根据比值的暗通道, 得到透射率(这里的 R_A 是 CV_32FC1 了, 节约空间)
+    R_A = compute_dark_channel<float>(R_A, H, W, radius);
+    float* t_ptr = R_A.ptr<float>();
+
+    // 对透射率做点小改变, 远景增强地更厉害点
+    auto discount = [border](const float x) ->float {
+        return x;
+        if(x >= 0 and x < border) return 2 * x * x;
+        else return x;
+    };
+    for(int i = 0;i < length; ++i)
+        t_ptr[i] = discount(1.f - weight * t_ptr[i]);
+
+    // 开始求解 J(x), 然后取反
+    cv::Mat result(H, W, CV_8UC3);
+    uchar* const res_ptr = result.ptr<uchar>();
+    for(int i = 0;i < length; ++i) {
+        const int p = 3 * i;
+        for(int c = 0;c < 3; ++c) {
+            const float J = (inv_ptr[p + c] - A[c]) * 1.f / t_ptr[i] + A[c];  // 偏大
+            res_ptr[p + c] = cv::saturate_cast<uchar>(J);
+        }
+    }
+    // 做去噪
+    if(denoise) {
+        cv::fastNlMeansDenoisingColored(result, result, 5, 5, 5, 15);
+    }
+    collections.emplace_back("dehazed", result.clone());
+
+    // 反转图像
+    for(int i = 0;i < total_length; ++i)
+        res_ptr[i] = 255 - res_ptr[i]; // 更大
+    collections.emplace_back("enhanced", result.clone());
+    return collections;
+        }
 } //end ns

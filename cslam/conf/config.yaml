@@ -143,7 +143,7 @@ Viewer.ShowKFs: 0
 # Display only edges with weight >= CovGraphMinFeats (only used for visualization)
 Viewer.CovGraphMinFeats: 100
 
-Viewer.ScaleFactor: 20.0
+Viewer.ScaleFactor: 1.0
 
 # Line Diameters
 Viewer.TrajMarkerSize: 0.25
